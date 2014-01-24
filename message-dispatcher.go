@@ -8,6 +8,9 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"os"
+	"os/signal"
+	"syscall"
 )
 
 var (
@@ -26,54 +29,71 @@ func init() {
 
 func main() {
 	flag.Parse()
-	if err := consumeQueue(queueUri, queueName); err != nil {
+
+	deliveries, err := getDeliveries(queueUri, queueName)
+	if err != nil {
 		log.Fatal(err)
 	}
+	if deliveries == nil {
+		os.Exit(1)
+	}
+
+	log.Printf("connected to: %q", queueUri)
+	log.Printf("consuming queue: %q", queueName)
+
+	errors := consumeDeliveries(deliveries, maxDispatchers)
+	for i := uint(0); i < maxDispatchers; i++ {
+		log.Printf("%s", <-errors)
+	}
+	os.Exit(1)
 }
 
-func consumeQueue(queueUri string, queueName string) error {
+func getDeliveries(queueUri string, queueName string) (<-chan amqp.Delivery, error) {
 	conn, err := amqp.Dial(queueUri)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	go handleSigQuit(conn)
 
 	channel, err := conn.Channel()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	deliveries, err := channel.Consume(queueName, "", false, true, true, false, nil)
 	if err != nil {
 		if err, ok := err.(*amqp.Error); ok {
 			if err.Code == amqp.AccessRefused && strings.HasSuffix(err.Reason, "in exclusive use") {
-				return nil
+				return nil, nil
 			}
 		}
-		return err
+		return nil, err
 	}
 
-	log.Printf("connected to: %q", queueUri)
-	log.Printf("consuming queue: %q", queueName)
-	errors := make(chan error)
-	for i := uint(0); i < maxDispatchers; i++ {
-		go handleDeliveries(deliveries, errors)
-	}
-
-	return <-errors
+	return deliveries, nil
 }
 
-func handleDeliveries(deliveries <-chan amqp.Delivery, errors chan error) {
+func consumeDeliveries(deliveries <-chan amqp.Delivery, maxDispatchers uint) <-chan error {
+	errors := make(chan error)
+	for i := uint(0); i < maxDispatchers; i++ {
+		go handleDeliveries(deliveries, i, errors)
+	}
+	return errors
+}
+
+func handleDeliveries(deliveries <-chan amqp.Delivery, handlerNumber uint, errors chan<- error) {
 	for delivery := range deliveries {
 		if err := handleDelivery(delivery); err != nil {
 			errors <- fmt.Errorf("%s: %#v", err, string(delivery.Body))
 			return
 		}
-
 		if err := delivery.Ack(false); err != nil {
-			errors <-fmt.Errorf("Error acknowledging message: %s", err)
+			errors <-fmt.Errorf("error acknowledging message: %s", err)
 			return
 		}
 	}
+
+	errors <-fmt.Errorf("handler %d disconnected from RabbitMQ server", handlerNumber)
 }
 
 func handleDelivery(delivery amqp.Delivery) error {
@@ -84,8 +104,16 @@ func handleDelivery(delivery amqp.Delivery) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("Received %d HTTP response when forwarding message: %s", resp.StatusCode, delivery.Body)
+		return fmt.Errorf("received %d HTTP response when forwarding message: %s", resp.StatusCode, delivery.Body)
 	}
 
 	return nil
+}
+
+func handleSigQuit(conn *amqp.Connection) {
+	quitSignal := make(chan os.Signal, 1)
+	signal.Notify(quitSignal, syscall.SIGQUIT)
+	<-quitSignal
+	log.Printf("received QUIT signal\n")
+	conn.Close()
 }
