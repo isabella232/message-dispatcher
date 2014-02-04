@@ -1,59 +1,79 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
+	"github.com/nuts/message-dispatcher/forwarders"
 	"github.com/streadway/amqp"
 	"log"
-	"net/http"
 	"strings"
 	"os"
 	"os/signal"
+	"net/url"
 	"syscall"
 )
 
 var (
-	queueUri       string
+	queueUrl       string
 	queueName      string
-	apiUri         string
+	apiUrl         string
 	maxDispatchers uint
 )
 
 func init() {
-	flag.StringVar(&queueUri, "from", queueUri, "RabbitMQ uri")
+	flag.StringVar(&queueUrl, "from", queueUrl, "RabbitMQ url")
 	flag.StringVar(&queueName, "q", queueName, "queue name")
-	flag.StringVar(&apiUri, "to", apiUri, "forward to api")
+	flag.StringVar(&apiUrl, "to", apiUrl, "forward to api url")
 	flag.UintVar(&maxDispatchers, "#", 1, "maximum number of concurrent dispatchers")
 }
 
 func main() {
 	flag.Parse()
 
-	deliveries, err := getDeliveries(queueUri, queueName)
+	deliveries, err := getDeliveries(queueUrl, queueName)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if deliveries == nil {
 		os.Exit(1)
 	}
+	log.Printf("connected to: %q", queueUrl)
 
-	log.Printf("connected to: %q", queueUri)
-	log.Printf("consuming queue: %q", queueName)
+	forwarder, err := getForwarder(apiUrl)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("forwarding to: %#v\n", apiUrl)
 
-	errors := consumeDeliveries(deliveries, maxDispatchers)
+	errors := consumeDeliveries(deliveries, forwarder, maxDispatchers)
 	for i := uint(0); i < maxDispatchers; i++ {
 		log.Printf("%s", <-errors)
 	}
 	os.Exit(1)
 }
 
-func getDeliveries(queueUri string, queueName string) (<-chan amqp.Delivery, error) {
-	conn, err := amqp.Dial(queueUri)
+func getForwarder(apiUrl string) (forwarders.Forwarder, error) {
+	apiEndpoint, err := url.Parse(apiUrl)
 	if err != nil {
 		return nil, err
 	}
-	go handleSigQuit(conn)
+
+	switch apiEndpoint.Scheme {
+	case "unix":
+		return forwarders.NewSocketForwarder(apiEndpoint), nil
+	case "http", "https":
+		return forwarders.NewHttpForwarder(apiEndpoint), nil
+	}
+
+	return nil, fmt.Errorf("invalid api url: %s", apiUrl)
+}
+
+func getDeliveries(queueUrl string, queueName string) (<-chan amqp.Delivery, error) {
+	conn, err := amqp.Dial(queueUrl)
+	if err != nil {
+		return nil, err
+	}
+	go handleSignals(conn)
 
 	channel, err := conn.Channel()
 	if err != nil {
@@ -73,47 +93,18 @@ func getDeliveries(queueUri string, queueName string) (<-chan amqp.Delivery, err
 	return deliveries, nil
 }
 
-func consumeDeliveries(deliveries <-chan amqp.Delivery, maxDispatchers uint) <-chan error {
+func consumeDeliveries(deliveries <-chan amqp.Delivery, forwarder forwarders.Forwarder, maxDispatchers uint) <-chan error {
 	errors := make(chan error)
 	for i := uint(0); i < maxDispatchers; i++ {
-		go handleDeliveries(deliveries, i, errors)
+		go forwarders.ForwardDeliveries(deliveries, forwarder, i, errors)
 	}
 	return errors
 }
 
-func handleDeliveries(deliveries <-chan amqp.Delivery, handlerNumber uint, errors chan<- error) {
-	for delivery := range deliveries {
-		if err := handleDelivery(delivery); err != nil {
-			errors <- fmt.Errorf("%s: %#v", err, string(delivery.Body))
-			return
-		}
-		if err := delivery.Ack(false); err != nil {
-			errors <-fmt.Errorf("error acknowledging message: %s", err)
-			return
-		}
-	}
-
-	errors <-fmt.Errorf("handler %d disconnected from RabbitMQ server", handlerNumber)
-}
-
-func handleDelivery(delivery amqp.Delivery) error {
-	resp, err := http.Post(apiUri, delivery.ContentType, bytes.NewReader(delivery.Body))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("received %d HTTP response when forwarding message: %s", resp.StatusCode, delivery.Body)
-	}
-
-	return nil
-}
-
-func handleSigQuit(conn *amqp.Connection) {
-	quitSignal := make(chan os.Signal, 1)
-	signal.Notify(quitSignal, syscall.SIGQUIT)
-	<-quitSignal
-	log.Printf("received QUIT signal\n")
+func handleSignals(conn *amqp.Connection) {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGQUIT, syscall.SIGINT)
+	sig := <-signals
+	log.Printf("received %s signal\n", sig)
 	conn.Close()
 }
