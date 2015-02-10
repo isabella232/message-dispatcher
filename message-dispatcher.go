@@ -6,50 +6,79 @@ import (
 	"github.com/nuts/message-dispatcher/forwarders"
 	"github.com/streadway/amqp"
 	"log"
-	"strings"
+	"net/url"
 	"os"
 	"os/signal"
-	"net/url"
+	"strings"
+	"sync"
 	"syscall"
+	"time"
 )
 
 var (
 	queueUrl       string
 	queueName      string
 	apiUrl         string
-	maxDispatchers uint
+	numDispatchers uint
+	consumeTimeout time.Duration
+	requeueFailed  bool
+	exitOnFailed   bool
+	verbose        bool
 )
 
 func init() {
 	flag.StringVar(&queueUrl, "from", queueUrl, "RabbitMQ url")
 	flag.StringVar(&queueName, "q", queueName, "queue name")
 	flag.StringVar(&apiUrl, "to", apiUrl, "forward to api url")
-	flag.UintVar(&maxDispatchers, "#", 1, "maximum number of concurrent dispatchers")
+	flag.UintVar(&numDispatchers, "#", 1, "number of concurrent dispatchers")
+	flag.DurationVar(&consumeTimeout, "t", consumeTimeout, "stop consuming when no messages arrive before the timeout")
+	flag.BoolVar(&requeueFailed, "requeue-failed", false, "requeue messages that failed to forward")
+	flag.BoolVar(&exitOnFailed, "exit-on-failed", false, "terminate the dispatcher when a forward fails")
+	flag.BoolVar(&verbose, "v", false, "verbose")
 }
 
 func main() {
 	flag.Parse()
 
-	deliveries, err := getDeliveries(queueUrl, queueName)
+	forwarder, err := getForwarder(apiUrl)
+	if err != nil {
+		log.Fatal(err)
+	}
+	channel, err := getChannel(queueUrl)
+	if err != nil {
+		log.Fatal(err)
+	}
+	deliveries, err := getDeliveries(channel, queueName)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if deliveries == nil {
 		os.Exit(1)
 	}
-	log.Printf("connected to: %q", queueUrl)
 
-	forwarder, err := getForwarder(apiUrl)
-	if err != nil {
-		log.Fatal(err)
+	if verbose {
+		log.Printf("connected to: %q", queueUrl)
+		log.Printf("consuming queue: %s", queueName)
+		log.Printf("forwarding to: %#v\n", apiUrl)
+		log.Printf("number of dispatchers: %d", numDispatchers)
+		if consumeTimeout > 0 {
+			log.Printf("consume timeout: %v", consumeTimeout)
+		} else {
+			log.Printf("consume timeout: none")
+		}
+		log.Printf("requeuing messages on failure: %v", requeueFailed)
+		log.Printf("terminating dispatchers on failure: %v", requeueFailed)
 	}
-	log.Printf("forwarding to: %#v\n", apiUrl)
 
-	errors := consumeDeliveries(deliveries, forwarder, maxDispatchers)
-	for i := uint(0); i < maxDispatchers; i++ {
-		log.Printf("%s", <-errors)
+	errors := consumeDeliveries(deliveries, forwarder, numDispatchers, consumeTimeout, requeueFailed, exitOnFailed)
+	exitStatus := 0
+
+	for error := range errors {
+		exitStatus = 1
+		log.Printf("%s", error)
 	}
-	os.Exit(1)
+
+	os.Exit(exitStatus)
 }
 
 func getForwarder(apiUrl string) (forwarders.Forwarder, error) {
@@ -68,18 +97,21 @@ func getForwarder(apiUrl string) (forwarders.Forwarder, error) {
 	return nil, fmt.Errorf("invalid api url: %s", apiUrl)
 }
 
-func getDeliveries(queueUrl string, queueName string) (<-chan amqp.Delivery, error) {
+func getChannel(queueUrl string) (*amqp.Channel, error) {
 	conn, err := amqp.Dial(queueUrl)
 	if err != nil {
 		return nil, err
 	}
-	go handleSignals(conn)
 
 	channel, err := conn.Channel()
 	if err != nil {
 		return nil, err
 	}
 
+	return channel, nil
+}
+
+func getDeliveries(channel *amqp.Channel, queueName string) (<-chan amqp.Delivery, error) {
 	deliveries, err := channel.Consume(queueName, "", false, true, true, false, nil)
 	if err != nil {
 		if err, ok := err.(*amqp.Error); ok {
@@ -93,18 +125,35 @@ func getDeliveries(queueUrl string, queueName string) (<-chan amqp.Delivery, err
 	return deliveries, nil
 }
 
-func consumeDeliveries(deliveries <-chan amqp.Delivery, forwarder forwarders.Forwarder, maxDispatchers uint) <-chan error {
+func consumeDeliveries(deliveries <-chan amqp.Delivery, forwarder forwarders.Forwarder, numDispatchers uint, consumeTimeout time.Duration, requeueFailed bool, returnOnFailed bool) <-chan error {
+	var wg sync.WaitGroup
 	errors := make(chan error)
-	for i := uint(0); i < maxDispatchers; i++ {
-		go forwarders.ForwardDeliveries(deliveries, forwarder, i, errors)
+	quit := make(chan error)
+
+	handleSignals(numDispatchers, quit)
+
+	for i := uint(0); i < numDispatchers; i++ {
+		go func(consumerId uint) {
+			wg.Add(1)
+			forwarders.ForwardDeliveries(deliveries, forwarder, consumerId, consumeTimeout, requeueFailed, returnOnFailed, quit, errors)
+			wg.Done()
+		}(i)
 	}
+	go func() {
+		wg.Wait()
+		close(errors)
+	}()
+
 	return errors
 }
 
-func handleSignals(conn *amqp.Connection) {
+func handleSignals(numDispatchers uint, quit chan<- error) {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGQUIT, syscall.SIGINT)
-	sig := <-signals
-	log.Printf("received %s signal\n", sig)
-	conn.Close()
+	go func() {
+		sig := <-signals
+		for i := uint(0); i < numDispatchers; i++ {
+			quit <- fmt.Errorf("quitting on %s signal\n", sig)
+		}
+	}()
 }
